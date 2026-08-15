@@ -1,160 +1,162 @@
-
 <div align="center">
 <h2>StereoCrafter: Diffusion-based Generation of Long and High-fidelity Stereoscopic 3D from Monocular Videos</h2>
 
-Sijie Zhao*&emsp;
-Wenbo Hu*&emsp;
-Xiaodong Cun*&emsp;
-Yong Zhang&dagger;&emsp;
-Xiaoyu Li&dagger;&emsp;<br>
-Zhe Kong&emsp;
-Xiangjun Gao&emsp;
-Muyao Niu&emsp;
-Ying Shan
+Sijie Zhao*&emsp; Wenbo Hu*&emsp; Xiaodong Cun*&emsp; Yong Zhang&dagger;&emsp;
+Xiaoyu Li&dagger;&emsp; Zhe Kong&emsp; Xiangjun Gao&emsp; Muyao Niu&emsp; Ying Shan
 
-&emsp;* equal contribution &emsp; &dagger; corresponding author 
+&emsp;* equal contribution &emsp; &dagger; corresponding author
 
-<h3>Tencent AI Lab&emsp;&emsp;ARC Lab, Tencent PCG</h3>
+<h3>Tencent AI Lab &emsp; ARC Lab, Tencent PCG</h3>
 
-<a href='https://arxiv.org/abs/2409.07447'><img src='https://img.shields.io/badge/arXiv-PDF-a92225'></a> &emsp;
-<a href='https://stereocrafter.github.io/'><img src='https://img.shields.io/badge/Project_Page-Page-64fefe' alt='Project Page'></a> &emsp;
-<a href='https://huggingface.co/TencentARC/StereoCrafter'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Weights-yellow'></a>
+<a href="https://arxiv.org/abs/2409.07447">Paper</a> &emsp;
+<a href="https://stereocrafter.github.io/">Project page</a> &emsp;
+<a href="https://huggingface.co/TencentARC/StereoCrafter2">StereoCrafter2 weights</a>
 </div>
 
-## 💡 Abstract
+This branch packages the upstream StereoCrafter v2 inference code and retains the
+original SVD implementation as a selectable backend. The default backend is
+`wan_vace`; `svd` remains available for the original StereoCrafter weights.
 
-We propose a novel framework to convert any 2D videos to immersive stereoscopic 3D ones that can be viewed on different display devices, like 3D Glasses, Apple Vision Pro and 3D Display. It can be applied to various video sources, such as movies, vlogs, 3D cartoons, and AIGC videos.
+## Installation
 
-![teaser](assets/teaser.jpg)
-
-## 💡 samaust/StereoCrafter fork
-
-* Provides a pyproject.toml file to allow to easily install using pip.
-* Adds inference scripts in stereocrafter.inference
-
-## 📣 News
-- `2024/12/27` We released our inference code and model weights.
-- `2024/09/11` We submitted our technical report on arXiv and released our project page.
-
-## 🎞️ Showcases
-Here we show some examples of input videos and their corresponding stereo outputs in Anaglyph 3D format.
-<div align="center">
-    <img src="assets/demo.gif">
-</div>
-
-
-## 🛠️ Installation as a package
-
-#### 1. Set up the environment
-We run our code on Python 3.14 and CUDA 13.0.
-Create and activate a python venv.
-
-#### 2. Install as a package
-
-To install directly from Git, run:
+The upstream v2 environment uses Python 3.13 and CUDA 12.8. Install directly from
+Git:
 
 ```bash
-pip install "stereocrafter @ git+https://github.com/samaust/StereoCrafter@python_package"
+pip install "stereocrafter @ git+https://github.com/samaust/StereoCrafter@v2_python_package"
 ```
 
-Alternatively, clone the repository and install the downloaded code folder from its root:
+For a local development checkout with demos and test tools:
 
 ```bash
-git clone --branch python_package https://github.com/samaust/StereoCrafter.git
+git clone --branch v2_python_package https://github.com/samaust/StereoCrafter.git
 cd StereoCrafter
-pip install .
+pip install -e ".[demo,dev]"
 ```
 
-Use `pip install -e .` instead if you want an editable install while developing locally.
+DepthCrafter and Forward-Warp are installed as package dependencies; this fork
+does not require Git submodules.
 
-## 🛠️ Cloning locally to try the demo scripts
+## Model backends
 
-#### 1. Clone the repo
-```bash
-git clone https://github.com/samaust/StereoCrafter
-cd StereoCrafter
-```
+| Backend | Base model | Inpainting checkpoint |
+| --- | --- | --- |
+| `wan_vace` (default) | `Wan-AI/Wan2.1-VACE-14B-diffusers` | `TencentARC/StereoCrafter2` |
+| `svd` | `stabilityai/stable-video-diffusion-img2vid-xt-1-1` | `TencentARC/StereoCrafter` |
 
-#### 2. Install demo dependencies
-```bash
-pip install -e ".[demo]"
-```
+Model arguments accept either Hugging Face identifiers or local directories.
+The default identifiers are downloaded and cached by Hugging Face libraries.
 
-For an installation directly from Git, use:
+## Inference demos
 
-```bash
-pip install "stereocrafter[demo] @ git+https://github.com/samaust/StereoCrafter@python_package"
-```
-
-The `demo` extra provides the OpenCV, Decord, Fire, and TorchVision dependencies
-used by the demo scripts and `stereocrafter.utils` video helpers.
-
-## 📦 Model Weights
-
-The weight are automatically downloaded and cached when running the inference scripts.
-
-#### 1. [SVD img2vid model](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1) for the image encoder and VAE.
-
-#### 2. [DepthCrafter model](https://huggingface.co/tencent/DepthCrafter) for the video depth estimation.
-
-#### 3. [StereoCrafter model](https://huggingface.co/TencentARC/StereoCrafter) for the stereo video generation.
-
-## 🔄 Inference
-
-Script:
+Generate the depth-splatting input:
 
 ```bash
-# in StereoCrafter project root directory
 sh run_depth_splatting_inference.sh
+```
+
+Run StereoCrafter2 with the default Wan/VACE backend:
+
+```bash
 sh run_inpainting_inference.sh
 ```
 
-There are two main steps in this script for generating stereo video.
+The equivalent command is:
 
-#### 1. Depth-Based Video Splatting Using the Video Depth from DepthCrafter
-Execute the following command:
 ```bash
-python depth_splatting_inference.py --pre_trained_path [PATH] --unet_path [PATH]
-                                    --input_video_path [PATH] --output_video_path [PATH]
+python demo/scripts/inpainting_inference.py \
+  --backend wan_vace \
+  --base_model Wan-AI/Wan2.1-VACE-14B-diffusers \
+  --inpainting_model TencentARC/StereoCrafter2 \
+  --input_video_path ./outputs/camel_splatting_results.mp4 \
+  --save_dir ./outputs \
+  --tile_num 2
 ```
-Arguments:
-- `--pre_trained_path`: Path to the SVD img2vid model weights (e.g., `./weights/stable-video-diffusion-img2vid-xt-1-1`).
-- `--unet_path`: Path to the DepthCrafter model weights (e.g., `./weights/DepthCrafter`).
-- `--input_video_path`: Path to the input video (e.g., `./source_video/camel.mp4`).
-- `--output_video_path`: Path to the output video (e.g., `./outputs/camel_splatting_results.mp4`).
-- `--max_disp`: Parameter controlling the maximum disparity between the generated right video and the input left video. Default value is `20` pixels.
 
-The first step generates a video grid with input video, visualized depth map, occlusion mask, and splatting right video, as shown below:
+Select the original implementation with `--backend svd`, the SVD base model,
+and `TencentARC/StereoCrafter`. Both backends produce side-by-side and anaglyph
+videos. The input is the four-panel video generated by the depth-splatting step.
 
-<img src="assets/camel_splatting_results.jpg" alt="camel_splatting_results" width="800"/> 
+## Python API
 
-#### 2. Stereo Video Inpainting of the Splatting Video
-Execute the following command:
-```bash
-python inpainting_inference.py --pre_trained_path [PATH] --unet_path [PATH]
-                               --input_video_path [PATH] --save_dir [PATH]
+```python
+from stereocrafter.inference.inpainting import (
+    available_inpainting_backends,
+    create_inpainter,
+)
+
+print(available_inpainting_backends())
+inpainter = create_inpainter()  # defaults to wan_vace
+right_frames = inpainter.inpaint(warped_frames, mask_frames)
 ```
-Arguments:
-- `--pre_trained_path`: Path to the SVD img2vid model weights (e.g., `stabilityai/stable-video-diffusion-img2vid-xt-1-1`).
-- `--unet_path`: Path to the StereoCrafter model weights (e.g., `TencentARC/StereoCrafter`).
-- `--input_video_path`: Path to the splatting video result generated by the first stage (e.g., `./outputs/camel_splatting_results.mp4`).
-- `--save_dir`: Directory for the output stereo video (e.g., `./outputs`).
-- `--tile_num`: The number of tiles in width and height dimensions for tiled processing, which allows for handling high resolution input without requiring more GPU memory. The default value is `1` (1 $\times$ 1 tile). For input videos with a resolution of 2K or higher, you could use more tiles to avoid running out of memory.
 
-The stereo video inpainting generates the stereo video result in side-by-side format and anaglyph 3D format, as shown below:
+Use the original SVD backend explicitly:
 
-<img src="assets/camel_sbs.jpg" alt="camel_sbs" width="800"/> 
+```python
+inpainter = create_inpainter(
+    "svd",
+    base_model="stabilityai/stable-video-diffusion-img2vid-xt-1-1",
+    inpainting_model="TencentARC/StereoCrafter",
+)
+right_frames = inpainter.inpaint(
+    warped_frames,
+    mask_frames,
+    frames_chunk=25,
+    overlap=3,
+    tile_num=1,
+    num_inference_steps=8,
+)
+```
 
-<img src="assets/camel_anaglyph.jpg" alt="camel_anaglyph" width="400"/>
+### Migrating from the python_package branch
 
-## 🤝 Acknowledgements
+The old fa�ade functions have been removed:
 
-We would like to express our gratitude to the following open-source projects:
-- [Stable Video Diffusion](https://github.com/Stability-AI/generative-models): A latent diffusion model trained to generate video clips from an image or text conditioning.
-- [DepthCrafter](https://github.com/Tencent/DepthCrafter): A novel method to generate temporally consistent depth sequences from videos.
+```python
+# Before
+from stereocrafter.inference.inpainting import load_models, tiled_inpaint
+pipeline = load_models()
+right_frames = tiled_inpaint(warped_frames, mask_frames, pipeline)
+```
 
+Migrate to an explicit backend object:
 
-## 📚 Citation
+```python
+# After
+from stereocrafter.inference.inpainting import create_inpainter
+inpainter = create_inpainter("svd")
+right_frames = inpainter.inpaint(warped_frames, mask_frames)
+```
+
+### Adding another backend
+
+A backend factory must return an object with a string `name` and an
+`inpaint(frames_warped, frames_mask, **options)` method. Frames use
+`[T, H, W, C]` layout and the returned RGB tensor must be float data in
+`[0, 1]`.
+
+```python
+from stereocrafter.inference.inpainting import register_inpainting_backend
+
+register_inpainting_backend("my_backend", MyInpainter)
+```
+
+Applications can then call `create_inpainter("my_backend", ...)`.
+
+## Outputs
+
+The v2 demo generates side-by-side and red/cyan anaglyph videos:
+
+<img src="assets/camel_sbs.png" alt="StereoCrafter2 side-by-side output" width="800"/>
+
+<img src="assets/camel_anaglyph.png" alt="StereoCrafter2 anaglyph output" width="400"/>
+
+## Acknowledgements
+
+StereoCrafter builds on Stable Video Diffusion, DepthCrafter, Forward-Warp, and
+Wan2.1-VACE.
+
+## Citation
 
 ```bibtex
 @article{zhao2024stereocrafter,

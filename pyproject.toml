@@ -5,22 +5,35 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "stereocrafter"
 description = "A framework to convert any 2D videos to immersive stereoscopic 3D"
+requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
+    "accelerate",
     "depthcrafter@git+https://github.com/samaust/DepthCrafter@python_package",
-    "diffusers",
+    "diffusers>=0.38",
     "forward_warp@git+https://github.com/samaust/Forward-Warp@python_package",
+    "ftfy",
     "numpy",
+    "peft",
+    "pillow",
+    "safetensors",
     "torch",
-    "transformers"
+    "transformers>=5.9",
 ]
 
 [project.optional-dependencies]
 demo = [
+    "av",
     "decord",
     "fire",
+    "imageio",
+    "imageio-ffmpeg",
     "opencv-python",
-    "torchvision<0.24",
+    "torchvision",
+]
+dev = [
+    "build",
+    "ruff",
 ]
 
 [tool.setuptools.packages.find]

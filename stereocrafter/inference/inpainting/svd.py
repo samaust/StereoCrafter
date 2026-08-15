@@ -141,22 +141,25 @@ def parse_resize_size(
 def load_models(
     pre_trained_path: str = "stabilityai/stable-video-diffusion-img2vid-xt-1-1",
     unet_path: str = "TencentARC/StereoCrafter",
+    *,
+    device: str | torch.device = "cuda",
+    dtype: torch.dtype = torch.float16,
 ) -> StableVideoDiffusionInpaintingPipeline:
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(
         pre_trained_path,
         subfolder="image_encoder",
         variant="fp16",
-        torch_dtype=torch.float16,
+        torch_dtype=dtype,
     )
 
     vae = AutoencoderKLTemporalDecoder.from_pretrained(
-        pre_trained_path, subfolder="vae", variant="fp16", torch_dtype=torch.float16
+        pre_trained_path, subfolder="vae", variant="fp16", torch_dtype=dtype
     )
 
     unet = UNetSpatioTemporalConditionModel.from_pretrained(
         unet_path,
         # variant="fp16",
-        torch_dtype=torch.float16,
+        torch_dtype=dtype,
     )
 
     image_encoder.requires_grad_(False)
@@ -168,9 +171,9 @@ def load_models(
         image_encoder=image_encoder,
         vae=vae,
         unet=unet,
-        torch_dtype=torch.float16,
+        torch_dtype=dtype,
     )
-    pipeline = pipeline.to("cuda")
+    pipeline = pipeline.to(device)
 
     return pipeline
 
@@ -200,12 +203,22 @@ def tiled_inpaint(
         overlap=3
         tile_num=2
     """
+    if frames_warped.ndim != 4 or frames_mask.ndim != 4:
+        raise ValueError("frames_warped and frames_mask must use [T, H, W, C] layout")
+    if frames_warped.shape[:3] != frames_mask.shape[:3]:
+        raise ValueError("frames_warped and frames_mask must share T, H, and W")
+    if frames_chunk <= 0 or not 0 <= overlap < frames_chunk:
+        raise ValueError("overlap must be non-negative and less than frames_chunk")
+    if tile_num <= 0 or num_inference_steps <= 0:
+        raise ValueError("tile_num and num_inference_steps must be positive")
+
     num_frames_warped = frames_warped.shape[0]
     num_frames_mask = frames_mask.shape[0]
 
-    assert num_frames_warped == num_frames_mask, (
-        "frames_warped and frames_mask must have same number of frames"
-    )
+    if num_frames_warped != num_frames_mask:
+        raise ValueError(
+            "frames_warped and frames_mask must have the same number of frames"
+        )
 
     # Remove alpha channel from frames_warped
     print(f"frames_warped.shape: {frames_warped.shape}")
@@ -325,7 +338,7 @@ def tiled_inpaint(
         )
 
         video_latents = video_latents.unsqueeze(0)
-        if video_latents == torch.float16:
+        if video_latents.dtype == torch.float16:
             pipeline.vae.to(dtype=torch.float16)
 
         video_frames = pipeline.decode_latents(
@@ -353,3 +366,38 @@ def tiled_inpaint(
     print(f"frames_output.shape: {frames_output.shape}")
 
     return frames_output
+
+
+class SvdInpainter:
+    """Stable Video Diffusion backend using the original StereoCrafter UNet."""
+
+    name = "svd"
+
+    def __init__(
+        self,
+        base_model: str = "stabilityai/stable-video-diffusion-img2vid-xt-1-1",
+        inpainting_model: str = "TencentARC/StereoCrafter",
+        *,
+        device: str | torch.device = "cuda",
+        dtype: torch.dtype = torch.float16,
+        pipeline: StableVideoDiffusionInpaintingPipeline | None = None,
+    ) -> None:
+        self.pipeline = pipeline or load_models(
+            pre_trained_path=base_model,
+            unet_path=inpainting_model,
+            device=device,
+            dtype=dtype,
+        )
+
+    def inpaint(
+        self,
+        frames_warped: torch.Tensor,
+        frames_mask: torch.Tensor,
+        **options,
+    ) -> torch.Tensor:
+        return tiled_inpaint(
+            frames_warped,
+            frames_mask,
+            self.pipeline,
+            **options,
+        )
