@@ -1047,6 +1047,7 @@ class WanVaceInpainter:
         prompt: str = "",
         **_: Any,
     ) -> torch.Tensor:
+        total_started = time.monotonic()
         _validate_video_inputs(
             frames_warped,
             frames_mask,
@@ -1205,7 +1206,10 @@ class WanVaceInpainter:
 
         output = torch.cat(generated_chunks, dim=2)[:, :, :total_frames]
         output = output[:, :, :, :original_height, :original_width]
-        return output[0].permute(1, 2, 3, 0).cpu().float()
+        result = output[0].permute(1, 2, 3, 0).cpu().float()
+        total_elapsed = time.monotonic() - total_started
+        print(f"Total processing complete in {total_elapsed:.1f}s", flush=True)
+        return result
 
 
 def _validate_video_inputs(
