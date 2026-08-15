@@ -1,0 +1,14 @@
+include License-Code.txt
+include README.md
+include pyproject.toml
+recursive-include stereocrafter *.py
+exclude .gitignore
+exclude requirements.txt
+exclude run_depth_splatting_inference.sh
+exclude run_inpainting_inference.sh
+prune assets
+prune demo
+prune dependency
+prune source_video
+prune build
+prune dist
