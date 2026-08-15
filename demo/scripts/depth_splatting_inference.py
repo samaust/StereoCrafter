@@ -11,9 +11,9 @@ from depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
 from depthcrafter.unet import DiffusersUNetSpatioTemporalConditionModelDepthCrafter
 from depthcrafter.utils import vis_sequence_depth
 from diffusers.training_utils import set_seed
+from diffusers.utils import export_to_video
 from fire import Fire
 from forward_warp import Forward_warp
-from torchvision.io import write_video
 
 
 def read_video_frames(video_path, process_length, target_fps, max_res):
@@ -147,12 +147,10 @@ class DepthCrafterDemo:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         if save_depth:
             np.savez_compressed(save_path + ".npz", depth=res)
-            write_video(
+            export_to_video(
+                list(vis),
                 save_path + "_depth_vis.mp4",
-                vis * 255.0,
-                fps=target_fps,
-                video_codec="h264",
-                options={"crf": "16"},
+                fps=int(target_fps),
             )
 
         return res, vis

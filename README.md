@@ -19,33 +19,56 @@ original SVD implementation as a selectable backend. The default backend is
 
 ## Installation
 
-The upstream v2 environment uses Python 3.13 and CUDA 12.8. Install directly from
+This package is tested with Python 3.14 and CUDA 13.0. Install directly from
 Git:
 
 ```bash
 pip install "stereocrafter @ git+https://github.com/samaust/StereoCrafter@v2_python_package"
 ```
 
-For a local development checkout with demos and test tools:
+To install from a local clone:
 
 ```bash
 git clone --branch v2_python_package https://github.com/samaust/StereoCrafter.git
 cd StereoCrafter
-pip install -e ".[demo,dev]"
+pip install .
 ```
 
 DepthCrafter and Forward-Warp are installed as package dependencies; this fork
 does not require Git submodules.
 
+### Optional demo dependencies
+
+The inference demo scripts require the `demo` extra, including `fire` and video
+I/O dependencies. Install it directly from Git:
+
+```bash
+pip install "stereocrafter[demo] @ git+https://github.com/samaust/StereoCrafter@v2_python_package"
+```
+
+Or, from a local clone:
+
+```bash
+pip install ".[demo]"
+```
+
 ## Model backends
 
-| Backend | Base model | Inpainting checkpoint |
-| --- | --- | --- |
-| `wan_vace` (default) | `Wan-AI/Wan2.1-VACE-14B-diffusers` | `TencentARC/StereoCrafter2` |
-| `svd` | `stabilityai/stable-video-diffusion-img2vid-xt-1-1` | `TencentARC/StereoCrafter` |
+| Backend | Base model | Inpainting checkpoint | First-use inpainting download |
+| --- | --- | --- | --- |
+| `wan_vace` (default) | `Wan-AI/Wan2.1-VACE-14B-diffusers` | `TencentARC/StereoCrafter2` | ~46.5 GB (43.3 GiB) |
+| `svd` | `stabilityai/stable-video-diffusion-img2vid-xt-1-1` | `TencentARC/StereoCrafter` | ~4.5 GB (4.2 GiB) |
 
 Model arguments accept either Hugging Face identifiers or local directories.
 The default identifiers are downloaded and cached by Hugging Face libraries.
+The estimates cover only the files loaded by the default inpainting backend; they
+exclude files already in the Hugging Face cache and may change as model
+repositories are updated.
+
+The depth-splatting demo is a shared prerequisite for either backend. Its first
+run downloads about 4.5 GB: ~1.46 GB of SVD image-encoder/VAE files plus ~3.05
+GB for `tencent/DepthCrafter`. Plan disk space accordingly if running the full
+depth-splatting and inpainting workflow.
 
 ## Inference demos
 
@@ -110,7 +133,7 @@ right_frames = inpainter.inpaint(
 
 ### Migrating from the python_package branch
 
-The old façade functions have been removed:
+The old faÃ§ade functions have been removed:
 
 ```python
 # Before
