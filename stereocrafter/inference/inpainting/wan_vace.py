@@ -1,6 +1,14 @@
+import gc
+import hashlib
 import html
+import json
 import math
 import re
+import shutil
+import tempfile
+import time
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from typing import Any
 
 import ftfy
@@ -8,8 +16,196 @@ import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKLWan, WanVACETransformer3DModel
 from diffusers.video_processor import VideoProcessor
+from filelock import FileLock
+from huggingface_hub.constants import HF_HOME
 from PIL import Image
 from transformers import AutoTokenizer, UMT5EncoderModel
+
+_MODEL_PRECISIONS = ("fp8", "int8", "w4a8", "fp16", "bf16")
+_QUANTIZED_PRECISIONS = frozenset(("fp8", "int8", "w4a8"))
+_QUANTIZED_CACHE_VERSION = 1
+
+
+def _package_version(package: str) -> str:
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _resolve_model_dtype(
+    model_precision: str, dtype: torch.dtype | None
+) -> torch.dtype:
+    if model_precision not in _MODEL_PRECISIONS:
+        choices = ", ".join(_MODEL_PRECISIONS)
+        raise ValueError(
+            f"Unknown wan_vace model precision {model_precision!r}; choose one of: "
+            f"{choices}"
+        )
+    expected = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(model_precision)
+    if expected is not None and dtype is not None and dtype != expected:
+        raise ValueError(
+            f"model_precision={model_precision!r} requires dtype={expected}"
+        )
+    return dtype or expected or torch.bfloat16
+
+
+def _torchao_config(model_precision: str):
+    try:
+        from diffusers import TorchAoConfig
+        from torchao.quantization import (
+            Float8DynamicActivationFloat8WeightConfig,
+            Float8DynamicActivationInt4WeightConfig,
+            Int8DynamicActivationInt8WeightConfig,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "Quantized wan_vace presets require torchao>=0.15. Install or update "
+            "StereoCrafter's dependencies, or select model_precision='fp16' or "
+            "'bf16'."
+        ) from exc
+
+    configs = {
+        "fp8": Float8DynamicActivationFloat8WeightConfig,
+        "int8": Int8DynamicActivationInt8WeightConfig,
+        "w4a8": Float8DynamicActivationInt4WeightConfig,
+    }
+    try:
+        config_factory = configs[model_precision]
+    except KeyError as exc:
+        raise ValueError(f"No TorchAO configuration for {model_precision!r}") from exc
+    return TorchAoConfig(config_factory())
+
+
+def _quantized_cache_path(
+    inpainting_model: str,
+    model_precision: str,
+    dtype: torch.dtype,
+    cache_root: str | Path | None,
+) -> Path:
+    root = (
+        Path(cache_root) if cache_root is not None else Path(HF_HOME) / "stereocrafter"
+    )
+    identity = json.dumps(
+        {
+            "source": str(inpainting_model),
+            "precision": model_precision,
+            "dtype": str(dtype),
+            "schema": _QUANTIZED_CACHE_VERSION,
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:12]
+    return root / "wan_vace" / f"{model_precision}-{digest}"
+
+
+def _cache_manifest(
+    inpainting_model: str, model_precision: str, dtype: torch.dtype
+) -> dict[str, Any]:
+    return {
+        "cache_version": _QUANTIZED_CACHE_VERSION,
+        "source_model": str(inpainting_model),
+        "model_precision": model_precision,
+        "compute_dtype": str(dtype),
+        "versions": {
+            "diffusers": _package_version("diffusers"),
+            "torch": _package_version("torch"),
+            "torchao": _package_version("torchao"),
+        },
+    }
+
+
+def _load_quantized_transformer(
+    inpainting_model: str,
+    model_precision: str,
+    dtype: torch.dtype,
+    device: torch.device,
+    *,
+    cache_root: str | Path | None = None,
+    rebuild: bool = False,
+    model_class=WanVACETransformer3DModel,
+):
+    cache_path = _quantized_cache_path(
+        inpainting_model, model_precision, dtype, cache_root
+    )
+    expected = _cache_manifest(inpainting_model, model_precision, dtype)
+    manifest_path = cache_path / "stereocrafter_quantization.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with FileLock(str(cache_path) + ".lock"):
+        valid_cache = False
+        if manifest_path.is_file() and not rebuild:
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                valid_cache = all(
+                    manifest.get(key) == expected[key]
+                    for key in (
+                        "cache_version",
+                        "source_model",
+                        "model_precision",
+                        "compute_dtype",
+                    )
+                )
+            except (OSError, ValueError):
+                valid_cache = False
+
+        if not valid_cache:
+            if cache_path.exists():
+                if not rebuild:
+                    raise ValueError(
+                        f"Quantized model cache at {cache_path} is incompatible or "
+                        "incomplete; set rebuild_quantized_cache=True to replace it"
+                    )
+                shutil.rmtree(cache_path)
+
+            temporary_path = Path(
+                tempfile.mkdtemp(prefix=f".{cache_path.name}-", dir=cache_path.parent)
+            )
+            try:
+                print(
+                    f"Quantizing {inpainting_model} as {model_precision} on CPU. "
+                    "This one-time step can take several minutes...",
+                    flush=True,
+                )
+                transformer = model_class.from_pretrained(
+                    inpainting_model,
+                    torch_dtype=dtype,
+                    quantization_config=_torchao_config(model_precision),
+                )
+                transformer.save_pretrained(
+                    temporary_path,
+                    safe_serialization=False,
+                )
+                (temporary_path / "stereocrafter_quantization.json").write_text(
+                    json.dumps(expected, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                temporary_path.replace(cache_path)
+            except ImportError as exc:
+                shutil.rmtree(temporary_path, ignore_errors=True)
+                if model_precision == "w4a8" and "mslk" in str(exc).lower():
+                    raise ImportError(
+                        "The w4a8 preset requires an MSLK build compatible with "
+                        "your installed PyTorch and CUDA versions."
+                    ) from exc
+                raise
+            except Exception:
+                shutil.rmtree(temporary_path, ignore_errors=True)
+                raise
+
+        print(
+            f"Loading cached {model_precision} transformer from {cache_path}...",
+            flush=True,
+        )
+        transformer = model_class.from_pretrained(
+            cache_path,
+            torch_dtype=dtype,
+            use_safetensors=False,
+        )
+        print(f"Moving {model_precision} transformer to {device}...", flush=True)
+        transformer = transformer.to(device)
+        print(f"{model_precision} transformer is ready on {device}.", flush=True)
+    return transformer
 
 
 class FlowMatchScheduler:
@@ -501,171 +697,149 @@ def blend_v(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor
     return b
 
 
-def run_wan_pipeline(
-    cond_frames,
-    mask_frames,
-    prompt_embeds,
-    transformer,
-    vae,
-    noise_scheduler,
-    videoprocessor,
-    vae_scale_factor_spatial,
-    vae_scale_factor_temporal,
-    transformer_patch_size,
-    device,
-    dtype,
-    generator,
-):
-    """Run one Wan denoising pass."""
-    #  cond_frames  [B, C, F, H, W]
-    height, width = cond_frames.shape[3], cond_frames.shape[4]
-    num_frames = cond_frames.shape[2]
-
-    with torch.no_grad():
-        # VideoProcessor  [B, F, C, H, W]
-        # [B, C, F, H, W] -> [B, F, C, H, W]
-        cond_frames_vp = cond_frames.permute(0, 2, 1, 3, 4)
-        mask_frames_vp = mask_frames.permute(0, 2, 1, 3, 4)
-
-        condition_video, mask, reference_images = preprocess_conditions(
-            video=cond_frames_vp,
-            mask=mask_frames_vp,
-            reference_images=None,
-            batch_size=1,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            dtype=dtype,
-            device=device,
-            video_processor=videoprocessor,
-            base=vae_scale_factor_spatial * transformer_patch_size,
-        )
-
-        conditioning_latents = prepare_video_latents(
-            condition_video, mask, reference_images, device, vae
-        )
-        mask_for_transformer = prepare_masks(
-            mask,
-            reference_images,
-            transformer_patch_size,
-            vae_scale_factor_temporal,
-            vae_scale_factor_spatial,
-        ).to(device, dtype=dtype)
-        control_hidden_states = torch.cat(
-            [conditioning_latents, mask_for_transformer], dim=1
-        ).to(dtype)
-
-    c = transformer.config.in_channels
-    f = (num_frames - 1) // vae_scale_factor_temporal + 1
-    h = height // vae_scale_factor_spatial
-    w = width // vae_scale_factor_spatial
-
-    latents = torch.randn(
-        1, c, f, h, w, device=device, dtype=dtype, generator=generator
-    )
-
-    for t in noise_scheduler.timesteps:
-        timestep_tensor = t.unsqueeze(0).to(device, dtype=dtype)
-        with torch.no_grad():
-            model_pred = transformer(
-                hidden_states=latents,
-                timestep=timestep_tensor,
-                encoder_hidden_states=prompt_embeds,
-                control_hidden_states=control_hidden_states,
-                return_dict=False,
-            )[0]
-        latents = noise_scheduler.step(model_pred, t, latents)
-
-    return latents
-
-
-def spatial_tiled_process(
-    cond_frames,
-    mask_frames,
-    tile_num,
-    tile_overlap,
-    prompt_embeds,
-    transformer,
-    vae,
-    noise_scheduler,
-    videoprocessor,
-    vae_scale_factor_spatial,
-    vae_scale_factor_temporal,
-    transformer_patch_size,
-    device,
-    dtype,
-    generator,
-):
-    """Run spatially tiled Wan inference."""
-    if tile_num == 1:
-        return run_wan_pipeline(
-            cond_frames,
-            mask_frames,
-            prompt_embeds,
-            transformer,
-            vae,
-            noise_scheduler,
-            videoprocessor,
-            vae_scale_factor_spatial,
-            vae_scale_factor_temporal,
-            transformer_patch_size,
-            device,
-            dtype,
-            generator,
-        )
-
-    height = cond_frames.shape[3]
-    width = cond_frames.shape[4]
-
-    #  VAE  Transformer Patch  16
-    base = vae_scale_factor_spatial * transformer_patch_size
+def _tile_slices(height, width, tile_num, tile_overlap, base):
+    """Return spatial tile coordinates plus dimensions used during merging."""
     tile_size = (
         int((height + tile_overlap * (tile_num - 1)) / tile_num) // base * base,
         int((width + tile_overlap * (tile_num - 1)) / tile_num) // base * base,
     )
     tile_stride = (tile_size[0] - tile_overlap, tile_size[1] - tile_overlap)
+    slices = [
+        (
+            min(i * tile_stride[0], height - tile_size[0]),
+            min(j * tile_stride[1], width - tile_size[1]),
+        )
+        for i in range(tile_num)
+        for j in range(tile_num)
+    ]
+    return slices, tile_size, tile_stride
 
-    cols = []
-    for i in range(tile_num):
-        rows = []
-        for j in range(tile_num):
-            h_start = min(i * tile_stride[0], height - tile_size[0])
-            w_start = min(j * tile_stride[1], width - tile_size[1])
 
-            cond_tile = cond_frames[
-                :,
-                :,
-                :,
-                h_start : h_start + tile_size[0],
-                w_start : w_start + tile_size[1],
-            ]
-            mask_tile = mask_frames[
-                :,
-                :,
-                :,
-                h_start : h_start + tile_size[0],
-                w_start : w_start + tile_size[1],
-            ]
-
-            tile_latent = run_wan_pipeline(
-                cond_tile,
-                mask_tile,
-                prompt_embeds,
-                transformer,
-                vae,
-                noise_scheduler,
-                videoprocessor,
-                vae_scale_factor_spatial,
-                vae_scale_factor_temporal,
-                transformer_patch_size,
-                device,
-                dtype,
-                generator,
+def encode_condition_tiles(
+    cond_frames,
+    mask_frames,
+    tile_num,
+    tile_overlap,
+    vae,
+    videoprocessor,
+    vae_scale_factor_spatial,
+    vae_scale_factor_temporal,
+    transformer_patch_size,
+    vae_device,
+    dtype,
+):
+    """Encode every spatial tile and stage compact conditioning on CPU."""
+    height, width = cond_frames.shape[-2:]
+    base = vae_scale_factor_spatial * transformer_patch_size
+    slices, tile_size, tile_stride = _tile_slices(
+        height, width, tile_num, tile_overlap, base
+    )
+    records = []
+    for index, (h_start, w_start) in enumerate(slices, start=1):
+        print(f"  encoding tile {index}/{len(slices)}", flush=True)
+        cond_tile = cond_frames[
+            :, :, :, h_start : h_start + tile_size[0], w_start : w_start + tile_size[1]
+        ]
+        mask_tile = mask_frames[
+            :, :, :, h_start : h_start + tile_size[0], w_start : w_start + tile_size[1]
+        ]
+        with torch.no_grad():
+            condition_video, mask, reference_images = preprocess_conditions(
+                video=cond_tile.permute(0, 2, 1, 3, 4),
+                mask=mask_tile.permute(0, 2, 1, 3, 4),
+                reference_images=None,
+                batch_size=1,
+                height=tile_size[0],
+                width=tile_size[1],
+                num_frames=cond_tile.shape[2],
+                dtype=dtype,
+                device=vae_device,
+                video_processor=videoprocessor,
+                base=base,
             )
-            rows.append(tile_latent)
-        cols.append(rows)
+            conditioning = prepare_video_latents(
+                condition_video, mask, reference_images, vae_device, vae
+            )
+            mask_latents = prepare_masks(
+                mask,
+                reference_images,
+                transformer_patch_size,
+                vae_scale_factor_temporal,
+                vae_scale_factor_spatial,
+            )
+            control = torch.cat([conditioning, mask_latents], dim=1).to(
+                device="cpu", dtype=dtype
+            )
+        records.append(
+            {
+                "control": control,
+                "height": tile_size[0],
+                "width": tile_size[1],
+                "num_frames": cond_tile.shape[2],
+            }
+        )
+        del condition_video, mask, reference_images, conditioning, mask_latents, control
+        if hasattr(vae, "clear_cache"):
+            vae.clear_cache()
+    return records, tile_stride
 
-    #  Latent  stride  overlap
+
+def denoise_condition_tiles(
+    records,
+    prompt_embeds,
+    transformer,
+    noise_scheduler,
+    device,
+    dtype,
+    generator,
+    vae_scale_factor_spatial,
+    vae_scale_factor_temporal,
+):
+    """Denoise all tiles during one transformer residency window."""
+    results = []
+    prompt_gpu = prompt_embeds.to(device=device, dtype=dtype)
+    for index, record in enumerate(records, start=1):
+        control = record["control"].to(device=device, dtype=dtype)
+        latent_frames = (record["num_frames"] - 1) // vae_scale_factor_temporal + 1
+        latents = torch.randn(
+            1,
+            transformer.config.in_channels,
+            latent_frames,
+            record["height"] // vae_scale_factor_spatial,
+            record["width"] // vae_scale_factor_spatial,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
+        total_steps = len(noise_scheduler.timesteps)
+        for step_index, timestep in enumerate(noise_scheduler.timesteps, start=1):
+            print(
+                f"\r  denoising tile {index}/{len(records)}, "
+                f"step {step_index}/{total_steps}",
+                end="",
+                flush=True,
+            )
+            timestep_tensor = timestep.unsqueeze(0).to(device, dtype=dtype)
+            with torch.no_grad():
+                prediction = transformer(
+                    hidden_states=latents,
+                    timestep=timestep_tensor,
+                    encoder_hidden_states=prompt_gpu,
+                    control_hidden_states=control,
+                    return_dict=False,
+                )[0]
+            latents = noise_scheduler.step(prediction, timestep, latents)
+        results.append(latents.to("cpu"))
+        del control, latents, prediction, timestep_tensor
+    print(flush=True)
+    return results
+
+
+def merge_tile_latents(
+    tiles, tile_num, tile_overlap, tile_stride, vae_scale_factor_spatial
+):
+    """Blend and merge completed spatial tiles entirely in host memory."""
+    cols = [tiles[i : i + tile_num] for i in range(0, len(tiles), tile_num)]
     latent_stride = (
         tile_stride[0] // vae_scale_factor_spatial,
         tile_stride[1] // vae_scale_factor_spatial,
@@ -674,15 +848,13 @@ def spatial_tiled_process(
         tile_overlap // vae_scale_factor_spatial,
         tile_overlap // vae_scale_factor_spatial,
     )
-
-    #  Latents
     results_cols = []
     for i, rows in enumerate(cols):
         results_rows = []
         for j, tile in enumerate(rows):
-            if i > 0:
+            if i > 0 and latent_overlap[0]:
                 tile = blend_v(cols[i - 1][j], tile, latent_overlap[0])
-            if j > 0:
+            if j > 0 and latent_overlap[1]:
                 tile = blend_h(rows[j - 1], tile, latent_overlap[1])
             results_rows.append(tile)
         results_cols.append(results_rows)
@@ -696,12 +868,30 @@ def spatial_tiled_process(
                 tile = tile[:, :, :, :, : latent_stride[1]]
             rows[j] = tile
         pixels.append(torch.cat(rows, dim=4))
+    return torch.cat(pixels, dim=3).cpu()
 
-    return torch.cat(pixels, dim=3)
+
+def _prepare_inpaint_inputs(
+    frames_warped: torch.Tensor, frames_mask: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep full-resolution inputs in host memory until a tile is processed."""
+
+    frames = (
+        frames_warped[..., :3]
+        .permute(3, 0, 1, 2)
+        .unsqueeze(0)
+        .to(device="cpu", dtype=torch.float32)
+    )
+    masks = (
+        frames_mask.permute(3, 0, 1, 2)
+        .unsqueeze(0)
+        .to(device="cpu", dtype=torch.float32)
+    )
+    return frames, masks
 
 
 class WanVaceInpainter:
-    """Wan VACE backend using the StereoCrafter2 transformer."""
+    """Wan VACE backend using explicit VAE and transformer residency phases."""
 
     name = "wan_vace"
 
@@ -711,7 +901,16 @@ class WanVaceInpainter:
         inpainting_model: str = "TencentARC/StereoCrafter2",
         *,
         device: str | torch.device | None = None,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = None,
+        model_precision: str = "fp8",
+        quantized_cache_dir: str | Path | None = None,
+        rebuild_quantized_cache: bool = False,
+        text_encoder_device: str | torch.device | None = None,
+        vae_device: str | torch.device | None = None,
+        sequential_offload: bool = True,
+        vae_tiling: bool = True,
+        vae_tile_size: int = 256,
+        vae_tile_stride: int = 192,
         tokenizer: Any | None = None,
         text_encoder: Any | None = None,
         vae: Any | None = None,
@@ -720,19 +919,45 @@ class WanVaceInpainter:
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
         )
-        self.dtype = dtype
+        self.model_precision = model_precision
+        self.dtype = _resolve_model_dtype(model_precision, dtype)
+        self.sequential_offload = sequential_offload
+        self.vae_device = torch.device(vae_device or self.device)
+        self.text_encoder_device = torch.device(text_encoder_device or "cpu")
+        initial_model_device = torch.device(
+            "cpu" if sequential_offload and self.device.type == "cuda" else self.device
+        )
+        initial_vae_device = torch.device(
+            "cpu"
+            if sequential_offload and self.vae_device.type == "cuda"
+            else self.vae_device
+        )
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(
             base_model, subfolder="tokenizer"
         )
         self.text_encoder = text_encoder or UMT5EncoderModel.from_pretrained(
-            base_model, subfolder="text_encoder", torch_dtype=dtype
-        ).to(self.device)
+            base_model, subfolder="text_encoder", torch_dtype=self.dtype
+        )
+        self.text_encoder.to(self.text_encoder_device)
         self.vae = vae or AutoencoderKLWan.from_pretrained(
-            base_model, subfolder="vae", torch_dtype=dtype
-        ).to(self.device)
-        self.transformer = transformer or WanVACETransformer3DModel.from_pretrained(
-            inpainting_model, torch_dtype=dtype
-        ).to(self.device)
+            base_model, subfolder="vae", torch_dtype=self.dtype
+        )
+        self.vae.to(initial_vae_device)
+        if transformer is not None:
+            self.transformer = transformer.to(initial_model_device)
+        elif model_precision in _QUANTIZED_PRECISIONS:
+            self.transformer = _load_quantized_transformer(
+                inpainting_model,
+                model_precision,
+                self.dtype,
+                initial_model_device,
+                cache_root=quantized_cache_dir,
+                rebuild=rebuild_quantized_cache,
+            )
+        else:
+            self.transformer = WanVACETransformer3DModel.from_pretrained(
+                inpainting_model, torch_dtype=self.dtype
+            ).to(initial_model_device)
         for model in (self.text_encoder, self.vae, self.transformer):
             model.eval()
             model.requires_grad_(False)
@@ -743,6 +968,26 @@ class WanVaceInpainter:
         self.transformer_patch_size = self.transformer.config.patch_size[1]
         self.vae_scale_factor_temporal = 2 ** sum(self.vae.temperal_downsample)
         self.vae_scale_factor_spatial = 2 ** len(self.vae.temperal_downsample)
+        if vae_tile_size <= 0 or vae_tile_stride <= 0:
+            raise ValueError("vae_tile_size and vae_tile_stride must be positive")
+        if (
+            vae_tile_size % self.vae_scale_factor_spatial
+            or vae_tile_stride % self.vae_scale_factor_spatial
+        ):
+            raise ValueError(
+                "vae_tile_size and vae_tile_stride must be multiples of the VAE "
+                f"spatial compression factor ({self.vae_scale_factor_spatial})"
+            )
+        self.vae_tiling = vae_tiling
+        if vae_tiling:
+            self.vae.enable_tiling(
+                tile_sample_min_height=vae_tile_size,
+                tile_sample_min_width=vae_tile_size,
+                tile_sample_stride_height=vae_tile_stride,
+                tile_sample_stride_width=vae_tile_stride,
+            )
+        elif hasattr(self.vae, "disable_tiling"):
+            self.vae.disable_tiling()
 
     def _prompt_embeds(self, prompt: str) -> torch.Tensor:
         with torch.no_grad():
@@ -750,12 +995,43 @@ class WanVaceInpainter:
                 [prompt],
                 do_classifier_free_guidance=False,
                 max_sequence_length=226,
-                device=self.device,
+                device=self.text_encoder_device,
                 dtype=self.dtype,
                 tokenizer=self.tokenizer,
                 text_encoder=self.text_encoder,
             )
-        return embeds
+        return embeds.to(device="cpu", dtype=self.dtype)
+
+    def _load_for_phase(self, label: str, model, destination: torch.device) -> float:
+        started = time.monotonic()
+        print(f"{label}: moving model to {destination}...", flush=True)
+        if destination.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(destination)
+        model.to(destination)
+        if destination.type == "cuda":
+            torch.cuda.synchronize(destination)
+        print(f"{label}: model transfer complete", flush=True)
+        return started
+
+    def _finish_phase(self, label: str, model, started: float) -> None:
+        if hasattr(model, "clear_cache"):
+            model.clear_cache()
+        peak = 0
+        active_cuda = self.device.type == "cuda" or self.vae_device.type == "cuda"
+        if active_cuda:
+            cuda_device = self.device if self.device.type == "cuda" else self.vae_device
+            torch.cuda.synchronize(cuda_device)
+            peak = torch.cuda.max_memory_allocated(cuda_device)
+        if self.sequential_offload and active_cuda:
+            model.to("cpu")
+            torch.cuda.synchronize(cuda_device)
+            gc.collect()
+            torch.cuda.empty_cache()
+        elapsed = time.monotonic() - started
+        print(
+            f"{label}: complete in {elapsed:.1f}s; CUDA peak {peak / 2**30:.2f} GiB",
+            flush=True,
+        )
 
     def inpaint(
         self,
@@ -780,12 +1056,9 @@ class WanVaceInpainter:
             tile_overlap=tile_overlap,
             inference_steps=inference_steps,
         )
-        frames = frames_warped[..., :3].permute(3, 0, 1, 2).unsqueeze(0).float()
-        masks = frames_mask.permute(3, 0, 1, 2).unsqueeze(0).float()
+        frames, masks = _prepare_inpaint_inputs(frames_warped, frames_mask)
         if masks.shape[1] not in (1, frames.shape[1]):
             raise ValueError("frames_mask must have one channel or match RGB channels")
-        frames = frames.to(self.device)
-        masks = masks.to(self.device)
         frames = frames * (1.0 - masks) + 0.5 * masks
 
         base = self.vae_scale_factor_spatial * self.transformer_patch_size
@@ -843,6 +1116,11 @@ class WanVaceInpainter:
             valid_size = (
                 (chunk_size - 1) // self.vae_scale_factor_temporal
             ) * self.vae_scale_factor_temporal + 1
+            print(
+                f"Temporal chunk {generated_length + 1}-{generated_length + valid_size} "
+                f"of {total_frames} frames",
+                flush=True,
+            )
             chunk_frames = frames[:, :, chunk_start : chunk_start + valid_size].clone()
             chunk_masks = masks[:, :, chunk_start : chunk_start + valid_size]
             actual_overlap = 0
@@ -853,43 +1131,71 @@ class WanVaceInpainter:
                     :, :, chunk_start:generated_length
                 ]
 
-            chunk_latents = spatial_tiled_process(
+            phase = "Phase 1/3 VAE encode"
+            started = self._load_for_phase(phase, self.vae, self.vae_device)
+            records, tile_stride = encode_condition_tiles(
                 chunk_frames,
                 chunk_masks,
                 tile_num,
                 tile_overlap,
-                prompt_embeds,
-                self.transformer,
                 self.vae,
-                scheduler,
                 self.video_processor,
                 self.vae_scale_factor_spatial,
                 self.vae_scale_factor_temporal,
                 self.transformer_patch_size,
+                self.vae_device,
+                self.dtype,
+            )
+            self._finish_phase(phase, self.vae, started)
+
+            phase = "Phase 2/3 transformer denoise"
+            started = self._load_for_phase(phase, self.transformer, self.device)
+            tile_latents = denoise_condition_tiles(
+                records,
+                prompt_embeds,
+                self.transformer,
+                scheduler,
                 self.device,
                 self.dtype,
                 generator,
+                self.vae_scale_factor_spatial,
+                self.vae_scale_factor_temporal,
             )
+            self._finish_phase(phase, self.transformer, started)
+            del records
+            chunk_latents = merge_tile_latents(
+                tile_latents,
+                tile_num,
+                tile_overlap,
+                tile_stride,
+                self.vae_scale_factor_spatial,
+            )
+            del tile_latents
+
+            phase = "Phase 3/3 VAE decode"
+            started = self._load_for_phase(phase, self.vae, self.vae_device)
             with torch.no_grad():
                 latents_mean = torch.tensor(
                     self.vae.config.latents_mean,
-                    device=self.device,
+                    device=self.vae_device,
                     dtype=torch.float32,
                 ).view(1, self.vae.config.z_dim, 1, 1, 1)
                 latents_std = torch.tensor(
                     self.vae.config.latents_std,
-                    device=self.device,
+                    device=self.vae_device,
                     dtype=torch.float32,
                 ).view(1, self.vae.config.z_dim, 1, 1, 1)
-                chunk_latents = (chunk_latents.float() * latents_std + latents_mean).to(
-                    self.vae.dtype
+                decode_latents = chunk_latents.to(self.vae_device)
+                decode_latents = (
+                    decode_latents.float() * latents_std + latents_mean
+                ).to(self.vae.dtype)
+                decoded = self.vae.decode(decode_latents, return_dict=False)[0]
+                new_frames = (
+                    decoded if not generated_length else decoded[:, :, actual_overlap:]
                 )
-                decoded = self.vae.decode(chunk_latents, return_dict=False)[0]
-                decoded = (decoded / 2 + 0.5).clamp(0, 1)
-
-            new_frames = (
-                decoded if not generated_length else decoded[:, :, actual_overlap:]
-            )
+                new_frames = (new_frames / 2 + 0.5).clamp(0, 1).cpu()
+            del chunk_latents, decode_latents, decoded, latents_mean, latents_std
+            self._finish_phase(phase, self.vae, started)
             if new_frames.shape[2] == 0:
                 raise RuntimeError(
                     "Temporal chunking made no progress; reduce frames_overlap"

@@ -13,11 +13,13 @@ dependencies = [
     "diffusers>=0.38",
     "forward_warp@git+https://github.com/samaust/Forward-Warp@python_package",
     "ftfy",
+    "filelock",
     "numpy",
     "peft",
     "pillow",
     "safetensors",
     "torch",
+    "torchao>=0.15",
     "transformers>=5.9",
 ]
 
