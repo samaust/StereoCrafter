@@ -19,6 +19,11 @@ def inpaint_video_frames(
     vae_tiling: bool = True,
     vae_tile_size: int = 256,
     vae_tile_stride: int = 192,
+    scheduler: str = "euler",
+    flow_shift: float = 5.0,
+    solver_order: int = 2,
+    solver_type: str = "bh2",
+    lower_order_final: bool = True,
     **inference_options,
 ):
     frames_left, frames_mask, frames_warped = read_video_opencv_four(input_video_path)
@@ -45,6 +50,13 @@ def inpaint_video_frames(
             model_options["text_encoder_device"] = text_encoder_device
         if vae_device is not None:
             model_options["vae_device"] = vae_device
+        inference_options.update(
+            scheduler=scheduler,
+            flow_shift=flow_shift,
+            solver_order=solver_order,
+            solver_type=solver_type,
+            lower_order_final=lower_order_final,
+        )
     inpainter = create_inpainter(backend, **model_options)
     frames_right = inpainter.inpaint(
         frames_warped,

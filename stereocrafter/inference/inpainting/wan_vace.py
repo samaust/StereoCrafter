@@ -14,7 +14,11 @@ from typing import Any
 import ftfy
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKLWan, WanVACETransformer3DModel
+from diffusers import (
+    AutoencoderKLWan,
+    UniPCMultistepScheduler,
+    WanVACETransformer3DModel,
+)
 from diffusers.video_processor import VideoProcessor
 from filelock import FileLock
 from huggingface_hub.constants import HF_HOME
@@ -245,6 +249,63 @@ class FlowMatchScheduler:
             sigma_ = self.sigmas[timestep_id + 1]
         prev_sample = sample + model_output * (sigma_ - sigma)
         return prev_sample
+
+
+def build_wan_scheduler(
+    scheduler: str = "euler",
+    *,
+    inference_steps: int,
+    flow_shift: float = 5.0,
+    solver_order: int = 2,
+    solver_type: str = "bh2",
+    lower_order_final: bool = True,
+    device: str | torch.device | None = None,
+):
+    """Validate and construct a fresh Wan VACE inference scheduler."""
+    if scheduler not in ("euler", "unipc"):
+        raise ValueError(
+            f"Unknown Wan VACE scheduler {scheduler!r}; choose one of: euler, unipc"
+        )
+    if inference_steps <= 0:
+        raise ValueError("inference_steps must be positive")
+    if flow_shift <= 0:
+        raise ValueError("flow_shift must be positive")
+    if solver_order <= 0:
+        raise ValueError("solver_order must be positive")
+    if solver_type not in ("bh1", "bh2"):
+        raise ValueError("solver_type must be one of: bh1, bh2")
+
+    if scheduler == "euler":
+        instance = FlowMatchScheduler()
+        instance.set_timesteps(
+            num_inference_steps=inference_steps,
+            denoising_strength=1.0,
+            shift=flow_shift,
+        )
+        return instance
+
+    instance = UniPCMultistepScheduler(
+        num_train_timesteps=1000,
+        solver_order=solver_order,
+        prediction_type="flow_prediction",
+        thresholding=False,
+        predict_x0=True,
+        solver_type=solver_type,
+        lower_order_final=lower_order_final,
+        use_flow_sigmas=True,
+        flow_shift=flow_shift,
+        final_sigmas_type="zero",
+        use_dynamic_shifting=False,
+    )
+    instance.set_timesteps(num_inference_steps=inference_steps, device=device)
+    return instance
+
+
+def _scheduler_prev_sample(step_result):
+    """Normalize custom Euler and Diffusers scheduler step results."""
+    if isinstance(step_result, torch.Tensor):
+        return step_result
+    return step_result.prev_sample
 
 
 def encode_vae_mode(vae, x):
@@ -788,7 +849,7 @@ def denoise_condition_tiles(
     records,
     prompt_embeds,
     transformer,
-    noise_scheduler,
+    scheduler_factory,
     device,
     dtype,
     generator,
@@ -799,6 +860,7 @@ def denoise_condition_tiles(
     results = []
     prompt_gpu = prompt_embeds.to(device=device, dtype=dtype)
     for index, record in enumerate(records, start=1):
+        noise_scheduler = scheduler_factory()
         control = record["control"].to(device=device, dtype=dtype)
         latent_frames = (record["num_frames"] - 1) // vae_scale_factor_temporal + 1
         latents = torch.randn(
@@ -828,9 +890,11 @@ def denoise_condition_tiles(
                     control_hidden_states=control,
                     return_dict=False,
                 )[0]
-            latents = noise_scheduler.step(prediction, timestep, latents)
+            latents = _scheduler_prev_sample(
+                noise_scheduler.step(prediction, timestep, latents)
+            )
         results.append(latents.to("cpu"))
-        del control, latents, prediction, timestep_tensor
+        del noise_scheduler, control, latents, prediction, timestep_tensor
     print(flush=True)
     return results
 
@@ -1043,6 +1107,11 @@ class WanVaceInpainter:
         tile_overlap: int = 128,
         tile_num: int = 2,
         inference_steps: int = 10,
+        scheduler: str = "euler",
+        flow_shift: float = 5.0,
+        solver_order: int = 2,
+        solver_type: str = "bh2",
+        lower_order_final: bool = True,
         seed: int | None = 0,
         prompt: str = "",
         **_: Any,
@@ -1057,6 +1126,28 @@ class WanVaceInpainter:
             tile_overlap=tile_overlap,
             inference_steps=inference_steps,
         )
+        scheduler_options = {
+            "scheduler": scheduler,
+            "inference_steps": inference_steps,
+            "flow_shift": flow_shift,
+            "solver_order": solver_order,
+            "solver_type": solver_type,
+            "lower_order_final": lower_order_final,
+            "device": self.device,
+        }
+        # Construct once up front so invalid options fail before model work.
+        validated_scheduler = build_wan_scheduler(**scheduler_options)
+        del validated_scheduler
+        summary = (
+            f"Scheduler: {scheduler}; NFE/steps: {inference_steps}; "
+            f"flow shift: {flow_shift:g}"
+        )
+        if scheduler == "unipc":
+            summary += (
+                f"; solver order: {solver_order}; solver type: {solver_type}; "
+                f"lower order final: {lower_order_final}"
+            )
+        print(summary, flush=True)
         frames, masks = _prepare_inpaint_inputs(frames_warped, frames_mask)
         if masks.shape[1] not in (1, frames.shape[1]):
             raise ValueError("frames_mask must have one channel or match RGB channels")
@@ -1092,10 +1183,7 @@ class WanVaceInpainter:
                 masks, (0, pad_width, 0, pad_height), mode="constant", value=0
             )
 
-        scheduler = FlowMatchScheduler()
-        scheduler.set_timesteps(
-            num_inference_steps=inference_steps, denoising_strength=1.0
-        )
+        scheduler_factory = lambda: build_wan_scheduler(**scheduler_options)
         generator = None
         if seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -1155,7 +1243,7 @@ class WanVaceInpainter:
                 records,
                 prompt_embeds,
                 self.transformer,
-                scheduler,
+                scheduler_factory,
                 self.device,
                 self.dtype,
                 generator,

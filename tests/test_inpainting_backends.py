@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 import torch
 
+from demo.package import inpainting_inference as package_demo
+
 from stereocrafter.inference.inpainting import (
     available_inpainting_backends,
     base,
@@ -20,6 +22,7 @@ class FakeInpainter:
         self.options = options
 
     def inpaint(self, frames_warped, frames_mask, **options):
+        self.inpaint_options = options
         return torch.zeros_like(frames_warped[..., :3])
 
 
@@ -116,6 +119,45 @@ class BackendRegistryTests(unittest.TestCase):
 
         with self.assertRaisesRegex(TypeError, "does not implement"):
             create_inpainter("invalid")
+
+
+class DemoSchedulerForwardingTests(unittest.TestCase):
+    def _run_demo(self, backend):
+        inpainter = FakeInpainter()
+        frames = torch.zeros(1, 2, 2, 3)
+        mask = torch.zeros(1, 2, 2, 1)
+        with (
+            patch.object(
+                package_demo, "read_video_opencv_four",
+                return_value=(frames, mask, frames),
+            ),
+            patch.object(package_demo, "create_inpainter", return_value=inpainter),
+        ):
+            package_demo.inpaint_video_frames(
+                "input.mp4",
+                backend=backend,
+                scheduler="unipc",
+                flow_shift=7.0,
+                solver_order=3,
+                solver_type="bh1",
+                lower_order_final=False,
+            )
+        return inpainter.inpaint_options
+
+    def test_package_forwards_scheduler_options_to_wan(self):
+        self.assertEqual(
+            self._run_demo("wan_vace"),
+            {
+                "scheduler": "unipc",
+                "flow_shift": 7.0,
+                "solver_order": 3,
+                "solver_type": "bh1",
+                "lower_order_final": False,
+            },
+        )
+
+    def test_package_keeps_scheduler_options_out_of_svd(self):
+        self.assertEqual(self._run_demo("svd"), {})
 
 
 if __name__ == "__main__":

@@ -144,7 +144,25 @@ python demo/scripts/inpainting_inference.py \
   --model_precision fp8 \
   --input_video_path ./outputs/camel_splatting_results.mp4 \
   --save_dir ./outputs \
+  --scheduler euler \
+  --flow_shift 5.0 \
   --tile_num 2
+```
+
+Euler remains the default Wan/VACE scheduler and preserves the existing sampling
+trajectory. To compare it with the optional UniPC flow scheduler while keeping
+the same shift and inference-step count, use:
+
+```bash
+python demo/scripts/inpainting_inference.py \
+  --backend wan_vace \
+  --input_video_path ./outputs/camel_splatting_results.mp4 \
+  --save_dir ./outputs \
+  --scheduler unipc \
+  --flow_shift 5 \
+  --solver_order 2 \
+  --solver_type bh2 \
+  --lower_order_final true
 ```
 
 Select the original implementation with `--backend svd`, the SVD base model,

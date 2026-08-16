@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -8,6 +9,9 @@ import torch
 
 from stereocrafter.inference.inpainting.wan_vace import (
     FlowMatchScheduler,
+    _scheduler_prev_sample,
+    build_wan_scheduler,
+    denoise_condition_tiles,
     WanVaceInpainter,
     _load_quantized_transformer,
     _prepare_inpaint_inputs,
@@ -100,6 +104,91 @@ class WanVaceHelperTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(first, torch.tensor([0.5])))
         self.assertTrue(torch.allclose(final, torch.tensor([0.0])))
+
+    def test_scheduler_builder_preserves_default_euler_sigmas(self):
+        scheduler = build_wan_scheduler(inference_steps=2, flow_shift=5.0)
+        expected = torch.tensor([1.0, 5.0 / 6.0])
+
+        self.assertIsInstance(scheduler, FlowMatchScheduler)
+        self.assertTrue(torch.allclose(scheduler.sigmas, expected))
+        first = scheduler.step(
+            torch.ones(1), scheduler.timesteps[0], torch.ones(1)
+        )
+        final = scheduler.step(torch.ones(1), scheduler.timesteps[1], first)
+        self.assertTrue(torch.allclose(final, torch.zeros(1)))
+
+    def test_unipc_builder_uses_fixed_flow_settings(self):
+        scheduler = build_wan_scheduler(
+            "unipc", inference_steps=4, flow_shift=5.0, solver_order=2,
+            solver_type="bh2", lower_order_final=True, device="cpu"
+        )
+
+        self.assertEqual(scheduler.config.prediction_type, "flow_prediction")
+        self.assertTrue(scheduler.config.use_flow_sigmas)
+        self.assertEqual(scheduler.config.flow_shift, 5.0)
+        self.assertEqual(scheduler.config.solver_order, 2)
+        self.assertEqual(scheduler.config.solver_type, "bh2")
+        self.assertTrue(scheduler.config.lower_order_final)
+        self.assertTrue(scheduler.config.predict_x0)
+        self.assertEqual(scheduler.config.final_sigmas_type, "zero")
+        self.assertFalse(scheduler.config.use_dynamic_shifting)
+        self.assertFalse(scheduler.config.thresholding)
+        self.assertEqual(len(scheduler.timesteps), 4)
+
+    def test_scheduler_option_validation(self):
+        invalid = (
+            ({"scheduler": "missing"}, "scheduler"),
+            ({"flow_shift": 0}, "flow_shift"),
+            ({"solver_order": 0}, "solver_order"),
+            ({"solver_type": "midpoint"}, "solver_type"),
+        )
+        for changes, message in invalid:
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(ValueError, message):
+                    build_wan_scheduler(inference_steps=2, **changes)
+
+    def test_scheduler_step_results_are_normalized(self):
+        tensor = torch.ones(1)
+        self.assertIs(_scheduler_prev_sample(tensor), tensor)
+        self.assertIs(
+            _scheduler_prev_sample(SimpleNamespace(prev_sample=tensor)), tensor
+        )
+
+    def test_each_tile_gets_a_fresh_stateful_scheduler(self):
+        instances = []
+
+        class StatefulScheduler:
+            def __init__(self):
+                self.timesteps = torch.tensor([1.0])
+                self.history = []
+                instances.append(self)
+
+            def step(self, model_output, timestep, sample):
+                self.history.append(model_output)
+                return SimpleNamespace(prev_sample=sample + len(self.history))
+
+        class Transformer:
+            config = SimpleNamespace(in_channels=1)
+
+            def __call__(self, **kwargs):
+                return (torch.zeros_like(kwargs["hidden_states"]),)
+
+        records = [
+            {"control": torch.zeros(1), "num_frames": 1, "height": 1, "width": 1}
+            for _ in range(2)
+        ]
+        with patch("torch.randn", return_value=torch.zeros(1, 1, 1, 1, 1)):
+            results = denoise_condition_tiles(
+                records, torch.zeros(1, 1, 1), Transformer(), StatefulScheduler,
+                torch.device("cpu"), torch.float32, None, 1, 1
+            )
+
+        self.assertEqual(len(instances), 2)
+        self.assertIsNot(instances[0], instances[1])
+        self.assertEqual([len(instance.history) for instance in instances], [1, 1])
+        self.assertTrue(
+            all(torch.equal(result, torch.ones_like(result)) for result in results)
+        )
 
     def test_latent_blending_preserves_shape_and_dtype(self):
         horizontal_a = torch.zeros(1, 1, 1, 2, 4, dtype=torch.float16)
