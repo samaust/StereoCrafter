@@ -1,1 +1,2 @@
-# pyproject.toml is the dependency source of truth.\n-e .[demo]\n
+# pyproject.toml is the dependency source of truth.
+-e .
